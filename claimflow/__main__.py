@@ -18,25 +18,32 @@ def main() -> None:
     ap.add_argument("--out", default="results")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--quick", action="store_true", help="fewer repetitions (smoke run)")
+    ap.add_argument("--report-only", action="store_true", help="rebuild claims/report/charts from results.json")
     args = ap.parse_args()
     cfg = LabConfig(seed=args.seed)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    reps = dict(seeds=3, audits=30, audit_seeds=2) if args.quick else dict(seeds=20, audits=300, audit_seeds=10)
+    q = args.quick
+    if args.report_only:
+        results = json.loads((out / "results.json").read_text())["results"]
+        claims = evaluate(results)
+        (out / "results.json").write_text(json.dumps({"results": results, "claims": claims}, indent=2, default=str))
+        all_charts(results, out / "charts")
+        print(f"rebuilt {write_report(results, claims, cfg, out)}")
+        return
     results = {
-        "e1": ex.e1_override_split(cfg, seeds=reps["seeds"]),
-        "e2": ex.e2_bounds_and_audit(cfg, audits=reps["audits"], seeds=reps["audit_seeds"]),
-        "e3": ex.e3_twins(cfg),
-        "e4": ex.e4_pairing(cfg),
-        "sensitivity": ex.sensitivity(cfg),
+        "e1": ex.e1_override_split(cfg, seeds=3 if q else 20),
+        "e2": ex.e2_bounds_and_audit(cfg, audits=20 if q else 100, seeds=2 if q else 10, per_seed=5 if q else 20),
+        "e3": ex.e3_gate(cfg, seeds=3 if q else 20),
+        "e4": ex.e4_pairing(cfg, seeds=2 if q else 10),
     }
     claims = evaluate(results)
     (out / "results.json").write_text(json.dumps({"results": results, "claims": claims}, indent=2, default=str))
     all_charts(results, out / "charts")
     report = write_report(results, claims, cfg, out)
     for c in claims:
-        print(f"{c['id']:<4} {c['verdict']:<10} {c['claim']}")
+        print(f"{c['id']:<4} {c['evidence']:<16} {c['verdict']:<10} {c['claim']}")
     print(f"\nwrote {report} in {time.time() - t0:.0f}s")
 
 

@@ -8,29 +8,30 @@ from .events import EventLog
 # Post, Lie #1: split overrides by comparing the human label with the AI label, joined by ID.
 SPLIT_BY_ID = """
 WITH paired AS (
-  SELECT o.decision_id, d.label AS ai_label, o.label AS human_label
+  SELECT o.action, d.label AS ai_label, o.label AS human_label
   FROM decision_events o
   JOIN decision_events d
     ON d.decision_id = o.draft_decision_id
    AND d.kind = 'ai_draft'
   WHERE o.kind = 'human_override'
 )
-SELECT count(*)                                         AS overrides,
-       count(*) FILTER (WHERE ai_label = human_label)  AS confirm_as_is,
-       count(*) FILTER (WHERE ai_label <> human_label) AS true_corrections
+SELECT count(*)                                                                    AS overrides,
+       count(*) FILTER (WHERE action = 'bulk_set')                                 AS bulk_set,
+       count(*) FILTER (WHERE action <> 'bulk_set' AND ai_label = human_label)     AS confirm_as_is,
+       count(*) FILTER (WHERE action <> 'bulk_set' AND ai_label <> human_label)    AS true_corrections
 FROM paired;
 """
 
 # Post, Lie #4: the naive join on (tenant, filename) to any earlier draft.
 FILENAME_JOIN = """
 WITH cand AS (
-  SELECT o.decision_id AS override_id, o.draft_decision_id AS true_draft, d.decision_id AS cand_draft
+  SELECT o.decision_id AS override_id
   FROM decision_events o
   JOIN decision_events d
     ON d.kind = 'ai_draft' AND d.tenant_id = o.tenant_id AND d.filename = o.filename AND d.seq < o.seq
   WHERE o.kind = 'human_override'
 ), per AS (
-  SELECT override_id, count(*) AS n, max(cand_draft = true_draft) AS has_true FROM cand GROUP BY override_id
+  SELECT override_id, count(*) AS n FROM cand GROUP BY override_id
 )
 SELECT (SELECT count(*) FROM decision_events WHERE kind = 'human_override') AS overrides,
        count(*) FILTER (WHERE n = 1)  AS clean_pairs,
@@ -52,13 +53,15 @@ SELECT count(*) FILTER (WHERE picked <> true_draft) FROM latest;
 
 
 def override_split(log: EventLog) -> dict:
-    overrides, cai, corr = log.q(SPLIT_BY_ID)[0]
+    overrides, bulk, cai, corr = log.q(SPLIT_BY_ID)[0]
     drafts = log.one("SELECT count(*) FROM decision_events WHERE kind='ai_draft'")
     return {
         "drafts": drafts,
         "overrides": overrides,
         "naive_override_rate": overrides / drafts,
+        "bulk_set": bulk,
         "confirm_as_is": cai,
+        "not_a_correction_share": (cai + bulk) / overrides if overrides else 0.0,
         "confirm_as_is_share": cai / overrides if overrides else 0.0,
         "true_corrections": corr,
         "true_correction_rate": corr / drafts,
@@ -81,7 +84,9 @@ def pairing_coverage(log: EventLog) -> dict:
 
 def error_bounds(log: EventLog) -> dict:
     s = override_split(log)
-    reviewed = log.one("SELECT count(DISTINCT subject_id) FROM decision_events WHERE kind='human_view'")
+    # reviewed = items a human actually looked at individually (bulk-set rows excluded)
+    reviewed = log.one("""SELECT count(DISTINCT subject_id) FROM decision_events
+                          WHERE kind = 'human_view' AND actor <> 'adjuster_bulk'""")
     oracle = log.one("""SELECT avg(d.label <> t.true_label) FROM decision_events d
                         JOIN oracle_truth t USING (subject_id) WHERE d.kind='ai_draft'""")
     return {

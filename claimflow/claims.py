@@ -1,107 +1,123 @@
-"""Post #1's claims, each evaluated against lab results.
-Verdicts: PASS (holds under default assumptions and the sensitivity grid),
-QUALIFIED (holds only under stated conditions — the post must say so), FAIL."""
+"""Post #1's claims, each tagged with what kind of evidence the lab can give:
+
+  BY CONSTRUCTION — the simulation's assumptions produce it; the lab shows the mechanism is
+                    coherent and its size *under those assumptions*. No verdict.
+  HARNESS         — the comparison method is tested; the magnitudes come from assumptions.
+  MEASURED        — an estimator is graded against ground truth it cannot see.
+
+Only HARNESS and MEASURED claims get PASS / QUALIFIED / FAIL.
+"""
 from __future__ import annotations
 
-import numpy as np
-
-STRATEGIES = {
-    "router: raise threshold": ("keyword_router", "sweep"),
-    "router: + twin verifier": ("keyword_router", "sweep_with_verifier"),
-    "router: margin confidence": ("keyword_router_margin", "sweep"),
-    "calibrated classifier": ("prob_classifier", "sweep"),
-}
+BY_CONSTRUCTION, HARNESS, MEASURED = "BY CONSTRUCTION", "HARNESS", "MEASURED"
 
 
-def error_at_budget(points: list[dict], budget: float) -> float:
-    """Lowest auto-passed error rate reachable while holding at most `budget` of docs
-    for human review (operating points from a threshold sweep, linearly interpolated)."""
-    pts = sorted({(p["hold_rate"], p["auto_passed_error_rate"]) for p in points})
-    feasible = [e for h, e in pts if h <= budget]
-    best = min(feasible) if feasible else float("inf")
-    for (h0, e0), (h1, e1) in zip(pts, pts[1:]):
-        if h0 <= budget < h1:
-            best = min(best, e0 + (e1 - e0) * (budget - h0) / (h1 - h0))
-    return best
-
-
-def frontier(e3: dict, budgets=(0.2, 0.33, 0.5)) -> dict:
-    return {name: {f"{int(b*100)}%": error_at_budget(e3[clf][key], b) for b in budgets}
-            for name, (clf, key) in STRATEGIES.items()}
+def _pct(x: float, d: int = 1) -> str:
+    return f"{100 * x:.{d}f}%"
 
 
 def evaluate(r: dict) -> list[dict]:
-    e1, e2, e3, e4, sens = r["e1"], r["e2"], r["e3"], r["e4"], r["sensitivity"]["grid"]
-    pick, click = e1["base"]["pick_to_accept"], e1["base"]["one_click_accept"]
-    seeds = e1["across_seeds"]["pick_to_accept"]
-    cai_range = (min(g["confirm_as_is_share"] for g in sens), max(g["confirm_as_is_share"] for g in sens))
+    e1, e2, e3, e4 = r["e1"], r["e2"], r["e3"], r["e4"]
+    out: list[dict] = []
+
+    def claim(cid, text, evidence, verdict, detail, post=""):
+        out.append({"id": cid, "claim": text, "evidence": evidence, "verdict": verdict,
+                    "detail": detail, "post_wording": post})
+
+    pick = e1["across_seeds"]["pick_to_accept"]
+    nac = pick["not_a_correction_share"]
+    claim("C1a", "When accepting requires a re-pick, the override rate misstates real corrections.",
+          BY_CONSTRUCTION, "—",
+          f"pick-to-accept, 20 seeds: override rate {_pct(pick['naive_override_rate']['mean'])}, real corrections "
+          f"{_pct(pick['true_correction_rate']['mean'])}; {_pct(nac['mean'],0)} of overrides changed nothing "
+          f"(range {_pct(nac['min'],0)}–{_pct(nac['max'],0)}); re-picks alone were "
+          f"{_pct(pick['confirm_as_is_share']['mean'],0)} of all overrides. Representative (median) run: seed {e1['representative_seed']}.",
+          "Production observation; the lab only illustrates the mechanism. Quote the mean, not one run.")
+    g = e2["grid"]
+    claim("C1b", "The share of overrides that aren't corrections depends on hold rate, bulk use and review habits.",
+          BY_CONSTRUCTION, "—",
+          f"Across {len(g)} assumption cells: {_pct(min(x['not_a_correction_share'] for x in g),0)}–"
+          f"{_pct(max(x['not_a_correction_share'] for x in g),0)}.", "Measure yours.")
+    pb = e1["paired_bulk_effect"]
+    claim("C1c", "Bulk 'set category' loses real corrections (stamps AI errors as human-confirmed).",
+          BY_CONSTRUCTION, "—",
+          f"Paired over {pb['n']} seeds: +{100*pb['mean_diff']:.2f}pp of documents corrected without bulk "
+          f"(t = {pb['t']:.1f}). Direction is built into the bulk model; size depends on bulk usage.",
+          "Mechanism, not a measured effect size.")
     b = e2["bounds"]
-    adj, single = e2["audit"]["adjudicated"], e2["audit"]["single_label"]
-    rt, pr = e3["keyword_router"]["at_default_threshold"], e3["prob_classifier"]["at_default_threshold"]
-    fr = frontier(e3)
-    grid = e4["grid"]
-    out = []
+    viol = [x for x in g if x["lower_bound"] > x["oracle_true_error"]]
+    gap = min(x["oracle_true_error"] - x["lower_bound"] for x in g)
+    worst = min(g, key=lambda x: x["oracle_true_error"] - x["lower_bound"])
+    claim("C2a", "corrections ÷ all suggestions is a lower bound on true error (if reviewers are right).",
+          MEASURED, "PASS" if not viol else "QUALIFIED",
+          f"Holds in {len(g)-len(viol)}/{len(g)} cells: reviewer accuracy 85–97%, wrong items opened 15–80%, "
+          f"correct items opened 2–40%, threshold 0.80/0.90, bulk use 0/20%. Tightest cell: gap {100*gap:.1f}pp (reviewers {worst['reviewer_accuracy']:.0%}, "
+          f"open-if-wrong {worst['p_open_if_wrong']:.0%}, open-if-right {worst['p_open_if_right']:.0%}). "
+          f"Default: {_pct(b['lower_bound'])} vs true {_pct(b['oracle_true_error'])}.",
+          "Lower bound if reviewers' corrections are right; can fail with weak reviewers at very high review coverage.")
+    over = sum(x["reviewed_subset_error"] > x["oracle_true_error"] for x in g)
+    claim("C2b", "Reviewed-subset error is biased; it is not a bound.",
+          BY_CONSTRUCTION, "—",
+          f"Overstates in {over}/{len(g)} cells, because every cell triggers review by low confidence or breakage. "
+          f"Review driven by value or random QA can understate.", "Never call it an upper bound.")
+    aud = e2["audit"]
 
-    def claim(cid, text, verdict, evidence, post_change=""):
-        out.append({"id": cid, "claim": text, "verdict": verdict, "evidence": evidence, "post_change": post_change})
+    def row(rate, lab, adj, trust=False):
+        return next(a for a in aud if a["ai_error_rate"].startswith(rate) and a["labeller_accuracy"] == lab
+                    and a["adjudication"] == adj and a["trust_reviewers"] == trust and not a.get("ambiguous_accuracy"))
+    good = [row(rt, 0.98, "double_all") for rt in ("low", "default", "high")]
+    amb = {a["adjudication"]: a for a in aud if a.get("ambiguous_accuracy")}
+    weak = {adj: [row(rt, 0.90, adj) for rt in ("low", "default", "high")]
+            for adj in ("none", "on_disagreement", "double_all", "gold_corrected")}
 
-    claim("C1a", "Naive override rate overstates the true correction rate when accepting requires a re-pick.",
-          "PASS" if pick["naive_override_rate"] > pick["true_correction_rate"] * 1.2 else "FAIL",
-          f"pick-to-accept: override rate {pick['naive_override_rate']:.1%} vs true corrections "
-          f"{pick['true_correction_rate']:.1%} (20 seeds: confirm-as-is {seeds['confirm_as_is_share']['mean']:.1%} "
-          f"± {seeds['confirm_as_is_share']['sd']:.1%}).")
-    claim("C1b", "'A third to half of overrides are confirm-as-is.'",
-          "PASS" if 0.33 <= cai_range[0] and cai_range[1] <= 0.5 else "QUALIFIED",
-          f"Lab default {pick['confirm_as_is_share']:.1%}; across the sensitivity grid "
-          f"{cai_range[0]:.0%}–{cai_range[1]:.0%}. The share depends on hold rate and how often correct items are opened.",
-          "Keep 'a third to half' as a production observation; add that the size depends on hold rate and review habits.")
-    claim("C1c", "One-click accept removes confirm-as-is noise.",
-          "PASS" if click["confirm_as_is"] == 0 else "FAIL",
-          f"one-click-accept: confirm-as-is {click['confirm_as_is']} of {click['overrides']} overrides.")
-    sc, sp = e1["across_seeds"]["one_click_accept"]["true_correction_rate"], seeds["true_correction_rate"]
-    claim("C1d", "NEW — bulk 'set category' hides real errors, not just adds noise.",
-          "PASS" if sc["mean"] - sp["mean"] > 2 * max(sc["sd"], sp["sd"]) / np.sqrt(len(sens)) else "FAIL",
-          f"true corrections captured (mean over seeds): one-click {sc['mean']:.1%} vs pick-to-accept with "
-          f"bulk-set {sp['mean']:.1%} — bulk-set stamped wrong labels as human-confirmed.",
-          "Add: bulk-set doesn't just inflate overrides, it stamps wrong labels as human-confirmed.")
-    claim("C2a", "The reviewed subset overstates error (people open what looks wrong).",
-          "PASS" if b["reviewed_subset_error"] > b["oracle_true_error"] else "FAIL",
-          f"reviewed-subset error {b['reviewed_subset_error']:.1%} vs true error {b['oracle_true_error']:.1%}.")
-    claim("C2b", "corrections ÷ all drafts is a lower bound.",
-          "PASS" if all(g["lower_bound"] <= g["oracle"] for g in sens) else "FAIL",
-          f"default {b['lower_bound']:.1%} ≤ true {b['oracle_true_error']:.1%}; holds in all {len(sens)} sensitivity cells.")
-    claim("C2c", "A blind stratified audit (20 per bin per week) recovers the true error.",
-          "PASS" if adj["coverage_across_seeds"] >= 0.88 else "QUALIFIED",
-          f"with adjudication: 95% CI covers truth {adj['coverage_across_seeds']:.0%} of runs, bias "
-          f"{adj['bias_pp']:+.1f}pp, ±{adj['ci_half_width_pp']:.1f}pp after 4 weeks. Single-label audit: bias "
-          f"{single['bias_pp']:+.1f}pp, coverage {single['coverage_across_seeds']:.0%}.",
-          "Add: audit labeller mistakes bias the estimate upward — send disagreements to a second blind labeller.")
-    hi_rt, hi_pr = rt["share_of_twin_errors_with_conf_ge_0_9"], pr["share_of_twin_errors_with_conf_ge_0_9"]
-    claim("C3a", "On look-alike twins the classifier is confidently wrong.",
-          "PASS" if min(hi_rt, hi_pr) >= 0.3 else ("QUALIFIED" if max(hi_rt, hi_pr) >= 0.3 else "FAIL"),
-          f"match-strength router: {rt['share_of_twin_errors_with_conf_ge_0_9']:.0%} of twin errors at ≥0.9; "
-          f"calibrated classifier: {pr['share_of_twin_errors_with_conf_ge_0_9']:.0%}. Twin pairs are "
-          f"{rt['twin_pair_error_share']:.0%} of errors in both.",
-          "Rewrite: true when confidence is a match-strength score; a calibrated or margin-based score sees twins.")
-    thr_worst = all(fr["router: raise threshold"]["33%"] >= v["33%"] for v in fr.values())
-    calib_fixes = fr["calibrated classifier"]["33%"] < fr["router: + twin verifier"]["33%"]
-    claim("C3b", "Raising the global threshold is an expensive way to catch twin errors.",
-          "QUALIFIED" if thr_worst and calib_fixes else ("PASS" if thr_worst else "FAIL"),
-          "Auto-passed error at a 33% human-review budget: " +
-          "; ".join(f"{k} {v['33%']:.1%}" for k, v in fr.items()) + ".",
-          "Rewrite: a threshold only works if confidence is computed against the runner-up.")
-    claim("C3c", "A twin-aware verification step beats raising the threshold.",
-          "PASS" if fr["router: + twin verifier"]["33%"] < fr["router: raise threshold"]["33%"] else "FAIL",
-          f"at 33% review budget: verifier {fr['router: + twin verifier']['33%']:.1%} vs threshold "
-          f"{fr['router: raise threshold']['33%']:.1%}; but margin confidence ({fr['router: margin confidence']['33%']:.1%}) "
-          f"beats both.",
-          "Lead with 'fix the confidence first', verification second.")
-    worst = max(grid, key=lambda g: g["filename_ambiguous_share"])
-    claim("C4", "Joining overrides to drafts by filename loses and misattributes ground truth.",
-          "PASS" if e4["base"]["filename_ambiguous_share"] > 0 and e4["base"]["id_join_coverage"] == 1 else "FAIL",
-          f"default: {e4['base']['filename_ambiguous_share']:.0%} ambiguous, latest-draft-wins picks the wrong draft "
-          f"{e4['base']['filename_latest_wins_wrong_share']:.0%} of the time; up to "
-          f"{worst['filename_ambiguous_share']:.0%} ambiguous at {worst['generic_filename_share']:.0%} generic names / "
-          f"{worst['docs_per_tenant']} docs per tenant. ID join: {e4['base']['id_join_coverage']:.0%}.",
-          "Add: the 'latest draft wins' fallback is worse than ambiguity — it is silently wrong.")
+    def span(rows, key="bias_pp"):
+        return f"{min(x[key] for x in rows):+.1f} to {max(x[key] for x in rows):+.1f}pp"
+    claim("C2c", "A blind stratified audit recovers the true error rate.",
+          MEASURED, "QUALIFIED",
+          f"98% labellers, double-labelled, reviewed items re-audited blind: bias {span(good)} across AI error rates "
+          f"of ~4/19/37%, coverage {min(x['coverage'] for x in good):.0%}–{max(x['coverage'] for x in good):.0%}. "
+          f"90% labellers: single label {span(weak['none'])}; second label on disagreement {span(weak['on_disagreement'])} "
+          f"(sign flips with the base rate); double-label everything {span(weak['double_all'])}; gold-slice "
+          f"Rogan–Gladen correction {span(weak['gold_corrected'])}, coverage "
+          f"{min(x['coverage'] for x in weak['gold_corrected']):.0%}–{max(x['coverage'] for x in weak['gold_corrected']):.0%} "
+          f"(gold-slice uncertainty not propagated). If labellers drop to 75% on ambiguous look-alikes (errors correlated "
+          f"across labellers): double-labelled bias {amb['double_all']['bias_pp']:+.1f}pp, coverage {amb['double_all']['coverage']:.0%}; "
+          f"gold-corrected {amb['gold_corrected']['bias_pp']:+.1f}pp.",
+          "Recovers it with good blind labellers. With weaker labellers every shortcut is biased in a base-rate-dependent "
+          "way: improve labellers and measure them against a gold slice.")
+    dg = e3["diagnostics"]
+    claim("C3a", "A match-strength score is confidently wrong on look-alikes.",
+          BY_CONSTRUCTION, "—",
+          f"Twin errors at ≥0.9: match-strength {_pct(dg['keyword_router']['twin_errors_conf_ge_0_9']['mean'],0)}, "
+          f"margin {_pct(dg['keyword_router_margin']['twin_errors_conf_ge_0_9']['mean'],0)} (by arithmetic: margin can't "
+          f"exceed {dg['keyword_router_margin']['max_family_conf']['max']:.2f} on look-alike families), classifier "
+          f"{_pct(dg['prob_classifier']['twin_errors_conf_ge_0_9']['mean'],0)}. Within look-alike families (pooled) no score "
+          f"separates right from wrong much: AUROC match-strength {dg['keyword_router']['pooled_family_auroc']['mean']:.2f}, "
+          f"margin {dg['keyword_router_margin']['pooled_family_auroc']['mean']:.2f}, classifier "
+          f"{dg['prob_classifier']['pooled_family_auroc']['mean']:.2f}.",
+          "Don't claim margin 'ranks twins better' — it works by pushing whole look-alike families below the rest.")
+    ab = e3["at_budget"]
+
+    def at(name, b):
+        x = ab[name][b]
+        return f"{_pct(x['exact']['mean'])}" if "exact" in x else "n/a"
+    names = list(ab)
+    lines = "; ".join(f"{n}: " + "/".join(at(n, b) for b in ("20%", "33%", "50%")) for n in names)
+    base33 = ab["match-strength, one global threshold"]["33%"]["exact"]["mean"]
+    better = [n for n in names if "exact" in ab[n]["33%"] and ab[n]["33%"]["exact"]["mean"] < base33]
+    claim("C3b", "At equal workload, treating look-alike families differently beats one global threshold.",
+          HARNESS, "PASS" if len(better) == len(names) - 1 else "QUALIFIED",
+          f"Errors passed automatically at 20/33/50% held, exactly in expectation (randomised gate at the boundary), mean of 20 seeds — "
+          f"{lines}. The ranking changes with the budget; magnitudes come from the generator. The rules are built from the "
+          f"generator's own vocabulary (an upper bound on hand-written rules); the classifiers are untuned.",
+          "Show all budgets; say the ranking depends on budget; disclose label budgets.")
+    e4b = e4["across_seeds"]
+    claim("C4", "Joining overrides to suggestions by filename loses and misattributes ground truth.",
+          HARNESS, "PASS" if e4b["filename_ambiguous_share"]["mean"] > 0 else "FAIL",
+          f"Interleaved timeline, 10 seeds: {_pct(e4b['filename_ambiguous_share']['mean'],0)} ambiguous; latest-draft-wins "
+          f"wrong {_pct(e4b['filename_latest_wins_wrong_share']['mean'],0)} (grid "
+          f"{_pct(min(x['filename_latest_wins_wrong_share'] for x in e4['grid']),0)}–"
+          f"{_pct(max(x['filename_latest_wins_wrong_share'] for x in e4['grid']),0)}). Magnitudes depend on the assumed "
+          f"filename collision rate; the direction holds whenever names collide. ID join: 100%.",
+          "Quote as a range; the size is an assumption.")
     return out

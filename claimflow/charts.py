@@ -29,12 +29,13 @@ def _title(fig, title: str, sub: str) -> None:
 
 
 def funnel(e1: dict, out: Path) -> None:
-    p = e1["base"]["pick_to_accept"]
+    p = e1["representative"]["pick_to_accept"]
     rows = [("AI suggestions", p["drafts"], SERIES[0]), ("Overridden by a human", p["overrides"], SERIES[0]),
             ("  ↳ Real corrections", p["true_corrections"], SERIES[1]),
-            ("  ↳ Re-picked the AI's answer", p["confirm_as_is"], BASE)]
-    fig, ax = plt.subplots(figsize=(12, 5.6), dpi=150)
-    fig.subplots_adjust(left=0.30, right=0.95, top=0.80, bottom=0.14)
+            ("  ↳ Re-picked the AI's answer", p["confirm_as_is"], BASE),
+            ("  ↳ Bulk-set to the AI's answer", p["bulk_set"], BASE)]
+    fig, ax = plt.subplots(figsize=(12, 6.2), dpi=150)
+    fig.subplots_adjust(left=0.31, right=0.95, top=0.80, bottom=0.12)
     for i, (_, v, c) in enumerate(rows):
         y = len(rows) - 1 - i
         ax.barh(y, v, height=0.62, color=c, edgecolor=SURFACE, linewidth=2)
@@ -42,18 +43,18 @@ def funnel(e1: dict, out: Path) -> None:
     ax.set_yticks(range(len(rows)), [r[0] for r in reversed(rows)])
     ax.set_xlim(0, p["drafts"] * 1.12)
     ax.xaxis.set_visible(False)
-    for s in ("top", "right", "bottom"):
-        ax.spines[s].set_visible(False)
-    _title(fig, f"A {p['naive_override_rate']:.0%} override rate hides a {p['true_correction_rate']:.0%} correction rate",
-           f"{p['confirm_as_is_share']:.0%} of overrides re-selected the AI's own answer (pick-to-accept interface)")
+    for s_ in ("top", "right", "bottom"):
+        ax.spines[s_].set_visible(False)
+    _title(fig, f"A {p['naive_override_rate']:.0%} override rate, a {p['true_correction_rate']:.0%} correction rate",
+           f"{p['not_a_correction_share']:.0%} of overrides changed nothing (median of 20 runs) — illustrates the mechanism, not a measured rate")
     fig.savefig(out / "01-override-funnel.png", facecolor=SURFACE)
     plt.close(fig)
 
 
 def bounds(e2: dict, out: Path) -> None:
-    b, a = e2["bounds"], e2["audit"]["adjudicated"]
+    b, a = e2["bounds"], e2["headline_audit"]
     lo, hi, tr = 100 * b["lower_bound"], 100 * b["reviewed_subset_error"], 100 * b["oracle_true_error"]
-    est, hw = 100 * a["estimate"]["mean"], a["ci_half_width_pp"]
+    est, hw = 100 * a["estimate"], a["ci_half_width_pp"]
     fig, ax = plt.subplots(figsize=(12, 5.2), dpi=150)
     fig.subplots_adjust(left=0.05, right=0.95, top=0.70, bottom=0.24)
     ax.set_xlim(0, max(60, hi + 8))
@@ -69,21 +70,21 @@ def bounds(e2: dict, out: Path) -> None:
     ax.axvline(tr, color=INK, lw=1.2, ls=(0, (3, 3)), zorder=1)
     ax.text(tr, 0.88, f"true error {tr:.0f}% (lab only)", ha="center", fontsize=12, color=INK)
     for x, c, lab, dy in [(lo, INK2, f"Lower bound {lo:.0f}%\ncorrections ÷ all suggestions", -1),
-                          (hi, INK2, f"Reviewed-subset error {hi:.0f}%\npeople open what looks wrong", -1),
+                          (hi, INK2, f"Reviewed-subset error {hi:.0f}%\nnot a bound — depends on why items get opened", -1),
                           (est, SERIES[0], f"Blind audit {est:.0f}% ± {hw:.0f}pp", 1)]:
         ax.scatter([x], [0], s=170, color=c, edgecolor=SURFACE, linewidth=2, zorder=3)
         if dy > 0:  # audit label sits right of its interval, clear of the truth line
             ax.text(est + hw + 1.2, 0.30, lab, ha="left", va="bottom", fontsize=12.5, color=INK, fontweight="bold")
             continue
         ax.text(x, -0.36, lab, ha="center", va="top", fontsize=12.5, color=INK2)
-    _title(fig, "Accuracy is a range until you audit what nobody reviewed",
-           "AI error rate: the dashboard's two candidate numbers vs. a 4-week blind stratified audit")
+    _title(fig, "Neither dashboard number is your error rate",
+           "A lower bound, a selection-biased rate, and a 4-week blind stratified audit (double-labelled, reviewed items re-audited)")
     fig.savefig(out / "02-error-bounds.png", facecolor=SURFACE)
     plt.close(fig)
 
 
-def confusion(e3: dict, out: Path) -> None:
-    conf = e3["keyword_router"]["confusion"]
+def confusion(e1: dict, out: Path) -> None:
+    conf = e1["confusion"]
     M = np.zeros((len(CATEGORIES), len(CATEGORIES)), dtype=int)
     for p in conf["pairs"]:
         M[CATEGORIES.index(p["ai"]), CATEGORIES.index(p["human"])] = p["n"]
@@ -112,35 +113,37 @@ def confusion(e3: dict, out: Path) -> None:
     ax.set_ylabel("AI picked", fontsize=13, labelpad=10)
     ax.set_xlabel("Human corrected to", fontsize=13, labelpad=10)
     _title(fig, "Errors cluster in look-alike pairs",
-           f"Real corrections only — two twin pairs account for {conf['twin_pair_share']:.0%} of {conf['total']} corrections")
+           f"Real corrections — {conf['twin_pair_share']:.0%} fall in two look-alike pairs (the lab generates twins, so this is illustrative)")
     fig.savefig(out / "03-twin-confusion.png", facecolor=SURFACE)
     plt.close(fig)
 
 
 def frontier(e3: dict, out: Path) -> None:
-    from .claims import STRATEGIES
+    shown = ["match-strength, one global threshold", "match-strength, threshold on look-alike families only",
+             "match-strength + look-alike evidence check", "classifier, 3,000 labels"]
     fig, ax = plt.subplots(figsize=(12, 7), dpi=150)
     fig.subplots_adjust(left=0.10, right=0.96, top=0.80, bottom=0.14)
-    for (name, (clf, key)), color in zip(STRATEGIES.items(), SERIES):
-        pts = sorted((p["hold_rate"] * 100, p["auto_passed_error_rate"] * 100) for p in e3[clf][key])
+    for name, color in zip(shown, SERIES):
+        pts = sorted((p["hold_rate"] * 100, p["auto_passed_error_rate"] * 100) for p in e3["curves"][name])
         xs, ys = zip(*pts)
-        ax.plot(xs, ys, color=color, lw=2.2, marker="o", ms=8, mec=SURFACE, mew=2, label=name)
-    ax.axvline(33, color=MUTED, lw=1, ls=(0, (3, 3)))
-    ax.text(33.8, ax.get_ylim()[1] * 0.95, "33% review budget", color=MUTED, fontsize=12)
+        ax.step(xs, ys, where="post", color=color, lw=2.2, label=name)  # deterministic operating points
+    ax.axvline(100 / 3, color=MUTED, lw=1, ls=(0, (3, 3)))
+    ax.text(34.2, 19.5, "⅓ review budget", color=MUTED, fontsize=12)
     ax.set_xlim(0, 100)
-    ax.set_ylim(0, None)
+    ax.set_ylim(0, 21)
     ax.set_xlabel("Share of documents held for a human (workload)")
     ax.set_ylabel("Errors that pass automatically")
     ax.xaxis.set_major_formatter(lambda v, _: f"{v:.0f}%")
     ax.yaxis.set_major_formatter(lambda v, _: f"{v:.0f}%")
+    ax.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(5))
     ax.grid(color=GRID, lw=1)
     ax.set_axisbelow(True)
-    for s in ("top", "right"):
-        ax.spines[s].set_visible(False)
-    ax.yaxis.set_major_locator(matplotlib.ticker.MultipleLocator(5))
+    for s_ in ("top", "right"):
+        ax.spines[s_].set_visible(False)
     ax.legend(loc="upper right", frameon=False, fontsize=12.5)
-    _title(fig, "Fix the confidence before you move the threshold",
-           "Same review workload, very different error rates — lower-left is better")
+    _title(fig, "Same workload, different errors — treat look-alikes differently",
+           f"Seed {e3['curves_seed']}, every threshold; lower-left is better.\n"
+           "Classifier: 3,000 labels. Rules: no labels, but built from the generator's own vocabulary (an upper bound).")
     fig.savefig(out / "04-workload-vs-errors.png", facecolor=SURFACE)
     plt.close(fig)
 
@@ -149,5 +152,5 @@ def all_charts(results: dict, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     funnel(results["e1"], out)
     bounds(results["e2"], out)
-    confusion(results["e3"], out)
+    confusion(results["e1"], out)
     frontier(results["e3"], out)
